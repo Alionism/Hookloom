@@ -1,0 +1,14 @@
+{
+  "appId": "app.hookloom.studio",
+  "appName": "Hookloom",
+  "webDir": "www",
+  "backgroundColor": "#0A0A14",
+  "server": {
+    "androidScheme": "https"
+  },
+  "plugins": {
+    "CapacitorHttp": {
+      "enabled": true
+    }
+  }
+}
