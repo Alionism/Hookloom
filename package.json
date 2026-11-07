@@ -3,12 +3,21 @@
   "version": "1.0.0",
   "private": true,
   "description": "Hookloom: viral Instagram Reel research and AI scenario studio",
+  "scripts": {
+    "fonts": "node scripts/copy-fonts.js",
+    "android:add": "npx cap add android",
+    "android:icons": "node scripts/make-icons.js",
+    "android:sync": "npx cap sync android"
+  },
   "dependencies": {
     "@capacitor/android": "^7.0.0",
-    "@capacitor/core": "^7.0.0"
+    "@capacitor/browser": "^7.0.0",
+    "@capacitor/core": "^7.0.0",
+    "@capacitor/share": "^7.0.0"
   },
   "devDependencies": {
     "@capacitor/cli": "^7.0.0",
-    "sharp": "^0.33.5"
+    "sharp": "^0.33.5",
+    "vazirmatn": "^33.0.3"
   }
 }
