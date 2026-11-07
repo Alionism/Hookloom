@@ -7,26 +7,25 @@
 ## معماری
 
 ```
-اپ (Capacitor + HTML/JS) ──POST /webhook/hookloom/order──▶ n8n ──▶ Apify → Gemini → شورای Claude/GPT/Gemini
-        ▲                                                        │ ذخیره در Google Sheets
-        │◀──────── اعلان پوش (FCM) در پایان کار یا خطا ◀──────────┘
-        └──GET /webhook/hookloom/job?job_id=…  (فقط یک‌بار، بعد از اعلان یا با دکمه بروزرسانی)
+اپ ──POST /webhook/hookloom/order──▶ n8n ──▶ Apify → Gemini → شورای Claude/GPT/Gemini ──▶ Google Sheets
+                                       │                                                     ▲
+                                       └── پایان/خطا: POST به Apps Script ──▶ ایمیل نتیجه     │
+اپ ──GET (فقط با دکمه «بروزرسانی»)──▶ Apps Script (Web App) ──────────────────────────────────┘
 ```
 
-- بدون پولینگ: اپ هیچ تایمر خودکاری ندارد. ورک‌فلو در پایان (یا هنگام خطا) اعلان پوش می‌فرستد و اپ نتیجه را یک‌بار می‌خواند.
-- توکن FCM دستگاه همراه سفارش (`fcm_token`) ارسال و در تب `jobs` ذخیره می‌شود.
-- تکه‌های JSON بزرگ (`*_2`, `*_3` ...) را وب‌هوک job سمت سرور به هم می‌چسباند.
-- هر دو وب‌هوک با هدر **`X-Call-Key`** (Header Auth) محافظت می‌شوند.
-- هر خطا در ورک‌فلو با Error Trigger گرفته می‌شود و سفارش (با `execution_id`) به‌صورت failed علامت می‌خورد.
+- اپ هیچ پولینگ یا درخواست خودکاری ندارد؛ فقط با اقدام کاربر (ثبت سفارش، دکمه بروزرسانی) درخواست می‌زند.
+- خواندن نتیجه از Apps Script انجام می‌شود و هیچ execution ای در n8n مصرف نمی‌کند. تکه‌های JSON بزرگ (`*_2`, `*_3` ...) همان‌جا به هم چسبانده می‌شوند.
+- در پایان کار (یا خطا) ورک‌فلو یک‌بار Apps Script را صدا می‌زند و ایمیل نتیجه (با متن کامل سناریو) می‌رسد.
+- خطاهای ورک‌فلو با Error Trigger گرفته و سفارش به‌صورت failed علامت می‌خورد.
+- وب‌هوک order با هدر **`X-Call-Key`** (Header Auth) محافظت می‌شود.
 
-## فعال‌سازی اعلان پوش (یک‌بار)
+## راه‌اندازی Apps Script (یک‌بار، بدون Firebase)
 
-1. در Firebase Console یک پروژه بسازید و اپ اندروید با Package name برابر `app.hookloom.studio` اضافه کنید؛ فایل `google-services.json` را بگیرید.
-2. در GitHub: Settings → Secrets → `GOOGLE_SERVICES_JSON` = محتوای فایل به‌صورت base64 (`base64 -w0 google-services.json`).
-3. در Firebase: Project settings → Service accounts → Generate new private key.
-4. در n8n یک Credential از نوع **Google Service Account API** بسازید (کلید مرحله ۳، گزینه «Set up for use in HTTP Request node»، Scope: `https://www.googleapis.com/auth/firebase.messaging`).
-5. در ورک‌فلو دو نود `FCM Push (Done)` و `FCM Push (Failed)` را باز کنید: Credential را انتخاب، `YOUR_FIREBASE_PROJECT_ID` را در URL عوض و نود را Enable کنید.
-6. APK جدید را از Releases نصب کنید.
+1. در گوگل شیت `Hookloom Data`: Extensions → Apps Script. محتوای `apps-script/Code.gs` را جایگذاری و ذخیره کنید.
+2. Project settings → Script properties: `CALL_KEY` = همان مقدار `X-Call-Key`. (اختیاری: `NOTIFY_EMAIL`)
+3. Deploy → New deployment → Web app → Execute as: **Me**، Who has access: **Anyone**. آدرس `/exec` را کپی کنید.
+4. در n8n در دو نود `Notify Email (Done)` و `Notify Email (Failed)` مقدار `YOUR_DEPLOYMENT_ID` در URL را با آدرس بالا عوض و نودها را Enable کنید (ورک‌فلو را دوباره Publish کنید).
+5. در اپ: تنظیمات → «آدرس API نتیجه» را وارد کنید.
 
 ## صفحات اپ
 

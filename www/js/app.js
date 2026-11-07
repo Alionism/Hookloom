@@ -43,7 +43,7 @@ async function shareText(title, text) {
 }
 
 /* ---------- تنظیمات ---------- */
-const getSettings = () => Object.assign({ baseUrl: DEFAULT_URL, key: '' }, LS.get('hl_settings', {}));
+const getSettings = () => Object.assign({ baseUrl: DEFAULT_URL, key: '', apiUrl: '' }, LS.get('hl_settings', {}));
 const saveSettings = (s) => LS.set('hl_settings', s);
 
 /* ---------- API ---------- */
@@ -52,9 +52,12 @@ class ApiError extends Error { constructor(msg, status, body) { super(msg); this
 async function api(path, opts) {
   const s = getSettings();
   if (!s.key) throw new ApiError('NO_KEY');
-  const url = s.baseUrl.replace(/\/+$/, '') + '/webhook/hookloom/' + path;
-  const headers = { 'X-Call-Key': s.key, 'Accept': 'application/json' };
-  if (opts && opts.body) headers['Content-Type'] = 'application/json';
+  const viaScript = !!s.apiUrl && path.indexOf('job?') === 0;
+  const url = viaScript
+    ? s.apiUrl.replace(/\?.*$/, '') + '?key=' + encodeURIComponent(s.key) + '&' + path.slice(4)
+    : s.baseUrl.replace(/\/+$/, '') + '/webhook/hookloom/' + path;
+  const headers = viaScript ? { 'Accept': 'application/json' } : { 'X-Call-Key': s.key, 'Accept': 'application/json' };
+  if (!viaScript && opts && opts.body) headers['Content-Type'] = 'application/json';
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 60000);
   try {
@@ -62,7 +65,10 @@ async function api(path, opts) {
     const txt = await r.text();
     if (!r.ok) throw new ApiError('HTTP ' + r.status, r.status, txt);
     if (!txt) return {};
-    try { return JSON.parse(txt); } catch (e) { return {}; }
+    let out = {};
+    try { out = JSON.parse(txt); } catch (e) { out = {}; }
+    if (viaScript && out && out.error === 'unauthorized') throw new ApiError('HTTP 403', 403, txt);
+    return out;
   } finally { clearTimeout(timer); }
 }
 
@@ -110,16 +116,14 @@ function parseRow(r) {
   };
 }
 
-/* ---------- دریافت نتیجه (بدون پولینگ) ----------
-   وقتی کار تمام شود (یا خطا بدهد) ورک‌فلو یک اعلان پوش می‌فرستد. اپ با دریافت آن
-   فقط یک‌بار نتیجه را از وب‌هوک job می‌خواند. هیچ تایمر خودکاری وجود ندارد؛
-   دکمه «بروزرسانی» دستی است و هنگام باز کردن اپ برای پروژه‌های در حال اجرا
-   حداکثر یک درخواست (با فاصله حداقل ۲ دقیقه) زده می‌شود. */
+/* ---------- دریافت نتیجه (فقط با اقدام کاربر) ----------
+   اپ هیچ تایمر یا درخواست خودکاری ندارد. وقتی کار تمام شد ایمیل نتیجه می‌رسد؛
+   کاربر دکمه «بروزرسانی» را می‌زند و نتیجه یک‌بار از Apps Script خوانده می‌شود
+   (خواندن از Apps Script هیچ execution ای در n8n مصرف نمی‌کند). */
 const STAGES = [
   ['queued', 'ثبت سفارش'], ['discovery', 'کشف ریلزهای ویرال'], ['video_analysis', 'تحلیل ویدیوها با Gemini'],
   ['council_analysis', 'شورای تحلیل‌گران (Claude / GPT / Gemini)'], ['council_scenario', 'شورای کارگردان‌ها و داورها'], ['done', 'تحویل سناریوی نهایی']
 ];
-const RESUME_GAP = 120000;
 
 async function refreshJob(id) {
   const j = getJob(id);
@@ -144,40 +148,6 @@ async function refreshJob(id) {
   }
 }
 
-async function refreshRunning() {
-  const list = jobsList().filter((j) => j.status === 'running' && Date.now() - (j.updated || 0) > RESUME_GAP);
-  for (const j of list) await refreshJob(j.id);
-  softRender(); updateBadge();
-}
-
-/* ---------- اعلان پوش (Firebase Cloud Messaging) ---------- */
-const PN = () => window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.PushNotifications;
-const getToken = () => LS.get('hl_fcm', '') || '';
-async function onPush(data, openIt) {
-  const id = data && data.job_id;
-  if (!id) return;
-  if (!getJob(id)) return;
-  await refreshJob(id);
-  softRender(); updateBadge();
-  if (openIt) location.hash = '#/job/' + encodeURIComponent(id);
-}
-async function initPush() {
-  const P = PN();
-  if (!P) return;
-  try {
-    P.addListener('registration', (t) => { if (t && t.value) LS.set('hl_fcm', t.value); });
-    P.addListener('registrationError', () => { /* Firebase تنظیم نشده یا اجازه داده نشده */ });
-    P.addListener('pushNotificationReceived', (n) => { onPush(n && n.data, false); toast((n && n.title) || 'نتیجه آماده شد'); });
-    P.addListener('pushNotificationActionPerformed', (a) => { onPush(a && a.notification && a.notification.data, true); });
-    try { await P.createChannel({ id: 'hookloom_jobs', name: 'نتیجه سفارش‌ها', importance: 4 }); } catch (e) { /* ignore */ }
-    let perm = await P.checkPermissions();
-    if (perm.receive === 'prompt' || perm.receive === 'prompt-with-rationale') perm = await P.requestPermissions();
-    if (perm.receive === 'granted') await P.register();
-  } catch (e) { /* پوش در دسترس نیست */ }
-}
-document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshRunning(); });
-const AppPlugin = () => window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.App;
-try { const A = AppPlugin(); if (A && A.addListener) A.addListener('appStateChange', (st) => { if (st && st.isActive) refreshRunning(); }); } catch (e) { /* ignore */ }
 
 function updateBadge() {
   const n = jobsList().filter((j) => j.status === 'running').length;
@@ -292,14 +262,12 @@ async function submitOrder(form) {
     instagram_handle: (fd.instagram_handle || '').replace(/^@+/, ''),
     min_views: Number(fd.min_views) || 1000000, days_window: Number(fd.days_window) || 90,
     reels_to_analyze: Math.min(10, Math.max(3, Number(fd.reels_to_analyze) || 8)),
-    content_language: fd.content_language || 'فارسی',
-    fcm_token: getToken()
+    content_language: fd.content_language || 'فارسی'
   });
   const btn = $('#submitBtn'); btn.disabled = true; btn.textContent = 'در حال ارسال به ورک‌فلو…';
   try {
     const res = await api('order', { method: 'POST', body: JSON.stringify(body) });
     if (!res || !res.job_id) throw new ApiError('پاسخ نامعتبر از سرور', 0, JSON.stringify(res));
-    delete body.fcm_token;
     upsertJob({ id: res.job_id, brief: body, title: body.business_name, status: 'running', stage: 'queued', progress: 5, message: 'سفارش ثبت شد', created: Date.now(), updated: Date.now() });
     LS.del('hl_draft');
     toast('سفارش ثبت شد ✓');
@@ -340,7 +308,7 @@ function viewJob(id) {
   const head = `<div class="jh"><button class="back" data-act="nav" data-to="#/jobs">›</button><h2>${esc(j.reelTitle || j.title || 'پروژه')}</h2><span class="badge ${st}">${STATUS_FA[st] || st}</span></div>`;
   let prog = '';
   if (st === 'running') {
-    const modeTxt = getToken() ? 'می‌توانید اپ را ببندید؛ با آماده‌شدن نتیجه یک اعلان دریافت می‌کنید.' : 'اعلان فعال نیست؛ برای دیدن پیشرفت دکمه بروزرسانی را بزنید.';
+    const modeTxt = 'می‌توانید اپ را ببندید. وقتی ایمیل نتیجه رسید، دکمه «بروزرسانی» را بزنید. اپ به‌صورت خودکار هیچ درخواستی نمی‌فرستد.';
     prog = `<div class="card"><div class="bar"><i style="width:${j.progress || 0}%"></i></div>
       <p class="msg"><b>${fa(j.progress || 0)}٪</b> · ${esc(j.message || 'در حال پردازش…')}</p>
       <ul class="steps">${STAGES.map((s, i) => `<li class="${i < idx ? 'ok' : (i === idx ? 'on' : '')}"><s>${i < idx ? '✓' : fa(i + 1)}</s>${s[1]}</li>`).join('')}</ul>
@@ -506,17 +474,18 @@ function viewSettings() {
   <div class="card">
     <div class="field"><label>آدرس سرور n8n</label><input class="ltr" id="s-url" value="${esc(s.baseUrl)}" inputmode="url" autocapitalize="none"><small>مثال: https://yourname.app.n8n.cloud</small></div>
     <div class="field"><label>کلید دسترسی (X-Call-Key)</label><div class="pwwrap"><input class="ltr" id="s-key" type="password" value="${esc(s.key)}" autocapitalize="none" autocomplete="off"><button class="mini" data-act="toggle-key">نمایش</button></div><small>همان مقدار Credential نوع Header Auth در n8n (نام هدر: X-Call-Key).</small></div>
+    <div class="field"><label>آدرس API نتیجه (Apps Script)</label><input class="ltr" id="s-api" value="${esc(s.apiUrl)}" inputmode="url" autocapitalize="none" placeholder="https://script.google.com/macros/s/.../exec"><small>اختیاری ولی پیشنهادی: خواندن نتیجه از این آدرس هیچ execution ای در n8n مصرف نمی‌کند. اگر خالی باشد از n8n خوانده می‌شود.</small></div>
     <div class="actions"><button class="btn" data-act="save-settings">💾 ذخیره</button><button class="btn ghost" data-act="test" id="testBtn">🔌 تست اتصال</button></div>
     <p id="testRes" class="sub" style="margin:10px 0 0"></p>
   </div>
   <div class="note">اپ دو آدرس را صدا می‌زند:<br><span dir="ltr">POST /webhook/hookloom/order</span><br><span dir="ltr">GET /webhook/hookloom/job?job_id=…</span> (فقط هنگام اعلان یا بروزرسانی دستی)<br>ورک‌فلو باید در n8n «Publish» شده باشد.</div>
   <div class="card"><b>داده‌های دستگاه</b><p class="sub" style="margin:4px 0 10px">تاریخچه پروژه‌ها فقط روی همین گوشی ذخیره شده است.</p><button class="btn danger" data-act="clear-all">🗑 پاک‌کردن همه پروژه‌ها</button></div>
-  <p class="sub" style="text-align:center">Hookloom v1.2 · ساخته‌شده با Capacitor</p>`;
+  <p class="sub" style="text-align:center">Hookloom v1.3 · ساخته‌شده با Capacitor</p>`;
 }
 function readSettings() {
   let url = ($('#s-url').value || '').trim().replace(/\/+$/, '');
   if (url && !/^https?:\/\//i.test(url)) url = 'https://' + url;
-  return { baseUrl: url || DEFAULT_URL, key: ($('#s-key').value || '').trim() };
+  return { baseUrl: url || DEFAULT_URL, key: ($('#s-key').value || '').trim(), apiUrl: ($('#s-api').value || '').trim() };
 }
 async function testConnection() {
   const out = $('#testRes'); const btn = $('#testBtn');
@@ -571,6 +540,4 @@ setInterval(() => {
 /* ---------- شروع ---------- */
 onRoute();
 updateBadge();
-initPush();
-refreshRunning();
 })();
