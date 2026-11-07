@@ -43,8 +43,10 @@ async function shareText(title, text) {
 }
 
 /* ---------- تنظیمات ---------- */
-const getSettings = () => Object.assign({ baseUrl: DEFAULT_URL, key: '' }, LS.get('hl_settings', {}));
+/* pollSec: فاصله بروزرسانی خودکار (ثانیه). 0 = فقط دستی. */
+const getSettings = () => Object.assign({ baseUrl: DEFAULT_URL, key: '', pollSec: 60 }, LS.get('hl_settings', {}));
 const saveSettings = (s) => LS.set('hl_settings', s);
+const POLL_OPTIONS = [[0, 'دستی (فقط با دکمه بروزرسانی)'], [30, 'هر ۳۰ ثانیه'], [60, 'هر ۱ دقیقه (پیشنهادی)'], [120, 'هر ۲ دقیقه'], [300, 'هر ۵ دقیقه']];
 
 /* ---------- API ---------- */
 class ApiError extends Error { constructor(msg, status, body) { super(msg); this.status = status; this.body = body; } }
@@ -105,13 +107,24 @@ function parseRow(r) {
   };
 }
 
-/* ---------- پایش وضعیت (Polling) ---------- */
+/* ---------- پایش وضعیت (کم‌مصرف) ----------
+   هر درخواست به وب‌هوک وضعیت = ۱ execution در n8n. برای کم‌کردن مصرف:
+   - بروزرسانی خودکار فقط وقتی صفحه همان پروژه باز و اپ روی صفحه است انجام می‌شود
+   - فاصله پیش‌فرض ۶۰ ثانیه است و در تنظیمات قابل تغییر است (یا کاملاً دستی)
+   - هنگام بازگشت به اپ فقط یک‌بار بروزرسانی می‌شود */
 const STAGES = [
   ['queued', 'ثبت سفارش'], ['discovery', 'کشف ریلزهای ویرال'], ['video_analysis', 'تحلیل ویدیوها با Gemini'],
   ['council_analysis', 'شورای تحلیل‌گران (Claude / GPT / Gemini)'], ['council_scenario', 'شورای کارگردان‌ها و داورها'], ['done', 'تحویل سناریوی نهایی']
 ];
+const MIN_GAP = 20000; /* حداقل فاصله دو بروزرسانی یک پروژه در حالت خودکار */
 let pollTimer = null; let polling = false;
-const schedule = (ms) => { clearTimeout(pollTimer); pollTimer = setTimeout(tick, ms || 7000); };
+const pollMs = () => { const s = Number(getSettings().pollSec); return (isNaN(s) ? 60 : s) * 1000; };
+function schedule(ms) {
+  clearTimeout(pollTimer);
+  const base = pollMs();
+  if (!base) return; /* حالت دستی */
+  pollTimer = setTimeout(() => tick(false), Math.max(ms || base, 1000));
+}
 
 async function fetchFull(id) {
   const row = await api('job?job_id=' + encodeURIComponent(id));
@@ -130,32 +143,48 @@ async function refreshJob(id, forceFull) {
     if (!light || !light.job_id) {
       const misses = (j.misses || 0) + 1;
       const old = Date.now() - (j.created || 0) > 4 * 60000;
-      if (misses > 6 && old) upsertJob({ id: id, status: 'failed', message: 'این سفارش در سرور پیدا نشد.', misses: misses });
-      else upsertJob({ id: id, misses: misses });
+      if (misses > 6 && old) upsertJob({ id: id, status: 'failed', message: 'این سفارش در سرور پیدا نشد.', misses: misses, updated: Date.now() });
+      else upsertJob({ id: id, misses: misses, updated: Date.now() });
       return;
     }
     const patch = { id: id, status: light.status || 'running', stage: light.stage || j.stage, progress: Number(light.progress) || 0, message: light.message || '', error: light.error || '', misses: 0, netErr: 0, lastError: '', updated: Date.now() };
     upsertJob(patch);
     if (forceFull || patch.stage !== j.stage || patch.status !== 'running') await fetchFull(id);
   } catch (e) {
-    upsertJob({ id: id, netErr: (j.netErr || 0) + 1, lastError: friendly(e) });
+    upsertJob({ id: id, netErr: (j.netErr || 0) + 1, lastError: friendly(e), updated: Date.now() });
   }
 }
 
-async function tick() {
+/* once=true: همه پروژه‌های در حال اجرا یک‌بار؛ once=false: فقط پروژه‌ای که الان باز است */
+async function tick(once) {
   if (polling) return;
   polling = true;
+  const r = route();
   try {
-    const running = jobsList().filter((j) => j.status === 'running');
-    for (const j of running) await refreshJob(j.id);
+    let targets = jobsList().filter((j) => j.status === 'running');
+    if (!once) targets = r.name === 'job' ? targets.filter((j) => j.id === r.id) : [];
+    for (const j of targets) await refreshJob(j.id);
     softRender();
   } finally {
     polling = false;
     updateBadge();
-    if (jobsList().some((j) => j.status === 'running') && !document.hidden) schedule();
+    const r2 = route(); const cur = r2.name === 'job' ? getJob(r2.id) : null;
+    if (cur && cur.status === 'running' && !document.hidden) schedule();
   }
 }
-document.addEventListener('visibilitychange', () => { if (!document.hidden && jobsList().some((j) => j.status === 'running')) { clearTimeout(pollTimer); tick(); } });
+/* هنگام ورود به صفحه یک پروژه در حال اجرا: اگر داده کهنه است یک‌بار بروزرسانی کن */
+function maybePoll(id) {
+  const j = getJob(id);
+  if (!j || j.status !== 'running' || !pollMs()) return;
+  const age = Date.now() - (j.updated || 0);
+  if (age > MIN_GAP) schedule(800); else schedule(Math.max(pollMs() - age, 1000));
+}
+document.addEventListener('visibilitychange', () => {
+  clearTimeout(pollTimer);
+  if (document.hidden || !pollMs()) return;
+  const stale = jobsList().filter((j) => j.status === 'running' && Date.now() - (j.updated || 0) > MIN_GAP);
+  if (stale.length) tick(true); else { const r = route(); if (r.name === 'job') maybePoll(r.id); }
+});
 
 function updateBadge() {
   const n = jobsList().filter((j) => j.status === 'running').length;
@@ -186,6 +215,12 @@ function render() {
   lastSig = sigFor(r);
   updateBadge();
 }
+function onRoute() {
+  clearTimeout(pollTimer);
+  render();
+  const r = route();
+  if (r.name === 'job') maybePoll(r.id);
+}
 function sigFor(r) {
   if (r.name === 'jobs') return JSON.stringify(jobsList().map((j) => [j.id, j.status, j.stage, j.progress, j.reelTitle]));
   if (r.name === 'job') { const j = getJob(r.id) || {}; const res = getRes(r.id); return JSON.stringify([j.status, j.stage, j.progress, j.message, j.error, j.lastError, !!res.scenario, !!res.patterns, !!res.reels, !!res.council, ui.tab[r.id]]); }
@@ -203,7 +238,7 @@ function softRender() {
   if (ds.length === open.length) ds.forEach((d, i) => { d.open = open[i]; });
   v.scrollTop = top;
 }
-window.addEventListener('hashchange', render);
+window.addEventListener('hashchange', onRoute);
 
 /* ---------- فرم سفارش ---------- */
 const LANGS = ['فارسی', 'English', 'العربية', 'Türkçe', 'Deutsch', 'Français', 'Español'];
@@ -273,11 +308,10 @@ async function submitOrder(form) {
   try {
     const res = await api('order', { method: 'POST', body: JSON.stringify(body) });
     if (!res || !res.job_id) throw new ApiError('پاسخ نامعتبر از سرور', 0, JSON.stringify(res));
-    upsertJob({ id: res.job_id, brief: body, title: body.business_name, status: 'running', stage: 'queued', progress: 5, message: 'سفارش ثبت شد', created: Date.now() });
+    upsertJob({ id: res.job_id, brief: body, title: body.business_name, status: 'running', stage: 'queued', progress: 5, message: 'سفارش ثبت شد', created: Date.now(), updated: Date.now() });
     LS.del('hl_draft');
     toast('سفارش ثبت شد ✓');
     location.hash = '#/job/' + encodeURIComponent(res.job_id);
-    schedule(4000);
   } catch (e) {
     toast(friendly(e));
     btn.disabled = false; btn.textContent = '🚀 شروع تحقیق و ساخت سناریو';
@@ -290,7 +324,10 @@ function dateFa(t) { try { return new Date(t).toLocaleString('fa-IR', { dateStyl
 function viewJobs() {
   const l = jobsList();
   if (!l.length) return '<h2 class="pg">پروژه‌ها</h2><div class="empty"><b>🎬</b>هنوز پروژه‌ای ندارید.<br><br><button class="btn" data-act="nav" data-to="#/new">ثبت اولین سفارش</button></div>';
-  return '<h2 class="pg">پروژه‌ها</h2><p class="sub">تاریخچه سفارش‌های شما روی همین دستگاه ذخیره می‌شود.</p>' + l.map((j) => {
+  const anyRunning = l.some((j) => j.status === 'running');
+  return '<h2 class="pg">پروژه‌ها</h2><p class="sub">تاریخچه سفارش‌های شما روی همین دستگاه ذخیره می‌شود.</p>' +
+    (anyRunning ? '<div class="actions" style="margin:0 0 12px"><button class="btn ghost" data-act="refresh-all">🔄 بروزرسانی وضعیت پروژه‌های در حال اجرا</button></div>' : '') +
+    l.map((j) => {
     const st = j.status || 'running';
     const stage = (STAGES.find((s) => s[0] === j.stage) || [0, ''])[1];
     return `<div class="card jobcard" data-act="nav" data-to="#/job/${encodeURIComponent(j.id)}">
@@ -311,11 +348,14 @@ function viewJob(id) {
   const head = `<div class="jh"><button class="back" data-act="nav" data-to="#/jobs">›</button><h2>${esc(j.reelTitle || j.title || 'پروژه')}</h2><span class="badge ${st}">${STATUS_FA[st] || st}</span></div>`;
   let prog = '';
   if (st === 'running') {
+    const sec = Number(getSettings().pollSec);
+    const modeTxt = sec ? 'بروزرسانی خودکار هر ' + fa(sec >= 60 ? sec / 60 : sec) + (sec >= 60 ? ' دقیقه' : ' ثانیه') + ' (فقط وقتی این صفحه باز است)' : 'بروزرسانی دستی — برای دیدن پیشرفت دکمه بروزرسانی را بزنید';
     prog = `<div class="card"><div class="bar"><i style="width:${j.progress || 0}%"></i></div>
       <p class="msg"><b>${fa(j.progress || 0)}٪</b> · ${esc(j.message || 'در حال پردازش…')}</p>
       <ul class="steps">${STAGES.map((s, i) => `<li class="${i < idx ? 'ok' : (i === idx ? 'on' : '')}"><s>${i < idx ? '✓' : fa(i + 1)}</s>${s[1]}</li>`).join('')}</ul>
       <p class="sub" style="margin:10px 0 0">زمان سپری‌شده: <b data-since="${j.created || Date.now()}"></b></p>
-      ${j.lastError ? `<p class="warn">⚠ ${esc(j.lastError)} (تلاش مجدد خودکار)</p>` : ''}
+      <p class="sub" style="margin:2px 0 0">${modeTxt}</p>
+      ${j.lastError ? `<p class="warn">⚠ ${esc(j.lastError)}</p>` : ''}
       <div class="actions"><button class="btn ghost" data-act="refresh" data-id="${esc(id)}">🔄 بروزرسانی</button><button class="btn ghost" data-act="delete-job" data-id="${esc(id)}">حذف از فهرست</button></div></div>`;
   } else if (st === 'failed') {
     prog = `<div class="card"><p class="err"><b>❌ ${esc(j.message || 'پردازش ناموفق بود')}</b></p>
@@ -475,17 +515,18 @@ function viewSettings() {
   <div class="card">
     <div class="field"><label>آدرس سرور n8n</label><input class="ltr" id="s-url" value="${esc(s.baseUrl)}" inputmode="url" autocapitalize="none"><small>مثال: https://yourname.app.n8n.cloud</small></div>
     <div class="field"><label>کلید دسترسی (X-Call-Key)</label><div class="pwwrap"><input class="ltr" id="s-key" type="password" value="${esc(s.key)}" autocapitalize="none" autocomplete="off"><button class="mini" data-act="toggle-key">نمایش</button></div><small>همان مقدار Credential نوع Header Auth در n8n (نام هدر: X-Call-Key).</small></div>
+    <div class="field"><label>بروزرسانی خودکار وضعیت</label><select id="s-poll">${opts(POLL_OPTIONS, s.pollSec)}</select><small>هر بروزرسانی یک اجرا (execution) در n8n مصرف می‌کند. بروزرسانی خودکار فقط وقتی صفحه پروژه باز است انجام می‌شود. با حالت «دستی» مصرف تقریباً صفر است.</small></div>
     <div class="actions"><button class="btn" data-act="save-settings">💾 ذخیره</button><button class="btn ghost" data-act="test" id="testBtn">🔌 تست اتصال</button></div>
     <p id="testRes" class="sub" style="margin:10px 0 0"></p>
   </div>
   <div class="note">اپ دو آدرس را صدا می‌زند:<br><span dir="ltr">POST /webhook/hookloom/order</span><br><span dir="ltr">GET /webhook/hookloom/job?job_id=…</span><br>ورک‌فلو باید در n8n «Publish» شده باشد.</div>
   <div class="card"><b>داده‌های دستگاه</b><p class="sub" style="margin:4px 0 10px">تاریخچه پروژه‌ها فقط روی همین گوشی ذخیره شده است.</p><button class="btn danger" data-act="clear-all">🗑 پاک‌کردن همه پروژه‌ها</button></div>
-  <p class="sub" style="text-align:center">Hookloom v1.0 · ساخته‌شده با Capacitor</p>`;
+  <p class="sub" style="text-align:center">Hookloom v1.1 · ساخته‌شده با Capacitor</p>`;
 }
 function readSettings() {
   let url = ($('#s-url').value || '').trim().replace(/\/+$/, '');
   if (url && !/^https?:\/\//i.test(url)) url = 'https://' + url;
-  return { baseUrl: url || DEFAULT_URL, key: ($('#s-key').value || '').trim() };
+  return { baseUrl: url || DEFAULT_URL, key: ($('#s-key').value || '').trim(), pollSec: Number($('#s-poll').value) };
 }
 async function testConnection() {
   const out = $('#testRes'); const btn = $('#testBtn');
@@ -510,6 +551,7 @@ document.addEventListener('click', (e) => {
   else if (act === 'copy-md') { copyText(getRes(id).scenarioMd || ''); }
   else if (act === 'share-md') { const r = getRes(id); shareText((r.scenario && r.scenario.title) || 'سناریوی هوک‌لوم', r.scenarioMd || ''); }
   else if (act === 'refresh') { toast('در حال بروزرسانی…'); refreshJob(id, true).then(() => { softRender(); schedule(); }); }
+  else if (act === 'refresh-all') { toast('در حال بروزرسانی…'); tick(true); }
   else if (act === 'reuse') { const j = getJob(id); if (j && j.brief) LS.set('hl_draft', j.brief); location.hash = '#/new'; }
   else if (act === 'delete-job') {
     if (confirm('این پروژه از فهرست گوشی حذف شود؟')) { saveJobs(jobsList().filter((x) => x.id !== id)); LS.del('hl_res_' + id); location.hash = '#/jobs'; }
@@ -537,7 +579,8 @@ setInterval(() => {
 }, 1000);
 
 /* ---------- شروع ---------- */
-render();
+onRoute();
 updateBadge();
-if (jobsList().some((j) => j.status === 'running')) tick();
+/* در شروع اپ، یک‌بار وضعیت پروژه‌های در حال اجرا را بروزرسانی کن (اگر حالت دستی نیست) */
+if (pollMs() && jobsList().some((j) => j.status === 'running' && Date.now() - (j.updated || 0) > MIN_GAP)) tick(true);
 })();
