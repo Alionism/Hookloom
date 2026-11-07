@@ -43,10 +43,8 @@ async function shareText(title, text) {
 }
 
 /* ---------- تنظیمات ---------- */
-/* pollSec: فاصله بروزرسانی خودکار (ثانیه). 0 = فقط دستی. */
-const getSettings = () => Object.assign({ baseUrl: DEFAULT_URL, key: '', pollSec: 60 }, LS.get('hl_settings', {}));
+const getSettings = () => Object.assign({ baseUrl: DEFAULT_URL, key: '' }, LS.get('hl_settings', {}));
 const saveSettings = (s) => LS.set('hl_settings', s);
-const POLL_OPTIONS = [[0, 'دستی (فقط با دکمه بروزرسانی)'], [30, 'هر ۳۰ ثانیه'], [60, 'هر ۱ دقیقه (پیشنهادی)'], [120, 'هر ۲ دقیقه'], [300, 'هر ۵ دقیقه']];
 
 /* ---------- API ---------- */
 class ApiError extends Error { constructor(msg, status, body) { super(msg); this.status = status; this.body = body; } }
@@ -92,99 +90,94 @@ function upsertJob(patch) {
 }
 const getRes = (id) => LS.get('hl_res_' + id, null) || {};
 
+function joinCols(r, base, n) {
+  let t = typeof r[base] === 'string' ? r[base] : '';
+  for (let i = 2; i <= n; i++) { const v = r[base + '_' + i]; if (typeof v === 'string') t += v; }
+  return t;
+}
 function parseRow(r) {
-  const pj = (k) => {
-    const v = r[k];
-    if (!v || typeof v !== 'string') return { ok: true, val: null };
+  const pj = (k, n) => {
+    const v = joinCols(r, k, n || 1);
+    if (!v) return { ok: true, val: null };
     try { return { ok: true, val: JSON.parse(v) }; } catch (e) { return { ok: false, val: null }; }
   };
-  const sc = pj('scenario_json');
+  const sc = pj('scenario_json', 4);
   return {
     status: r.status, stage: r.stage, progress: Number(r.progress) || 0, message: r.message || '', error: r.error || '',
     brief: pj('brief_json').val, strategy: pj('hashtags_json').val, reels: pj('reels_json').val,
-    patterns: pj('patterns_json').val, scenario: sc.val, scenarioBroken: !sc.ok,
-    scenarioMd: r.scenario_markdown || '', council: pj('council_json').val
+    patterns: pj('patterns_json', 3).val, scenario: sc.val, scenarioBroken: !sc.ok,
+    scenarioMd: joinCols(r, 'scenario_markdown', 3), council: pj('council_json', 2).val
   };
 }
 
-/* ---------- پایش وضعیت (کم‌مصرف) ----------
-   هر درخواست به وب‌هوک وضعیت = ۱ execution در n8n. برای کم‌کردن مصرف:
-   - بروزرسانی خودکار فقط وقتی صفحه همان پروژه باز و اپ روی صفحه است انجام می‌شود
-   - فاصله پیش‌فرض ۶۰ ثانیه است و در تنظیمات قابل تغییر است (یا کاملاً دستی)
-   - هنگام بازگشت به اپ فقط یک‌بار بروزرسانی می‌شود */
+/* ---------- دریافت نتیجه (بدون پولینگ) ----------
+   وقتی کار تمام شود (یا خطا بدهد) ورک‌فلو یک اعلان پوش می‌فرستد. اپ با دریافت آن
+   فقط یک‌بار نتیجه را از وب‌هوک job می‌خواند. هیچ تایمر خودکاری وجود ندارد؛
+   دکمه «بروزرسانی» دستی است و هنگام باز کردن اپ برای پروژه‌های در حال اجرا
+   حداکثر یک درخواست (با فاصله حداقل ۲ دقیقه) زده می‌شود. */
 const STAGES = [
   ['queued', 'ثبت سفارش'], ['discovery', 'کشف ریلزهای ویرال'], ['video_analysis', 'تحلیل ویدیوها با Gemini'],
   ['council_analysis', 'شورای تحلیل‌گران (Claude / GPT / Gemini)'], ['council_scenario', 'شورای کارگردان‌ها و داورها'], ['done', 'تحویل سناریوی نهایی']
 ];
-const MIN_GAP = 20000; /* حداقل فاصله دو بروزرسانی یک پروژه در حالت خودکار */
-let pollTimer = null; let polling = false;
-const pollMs = () => { const s = Number(getSettings().pollSec); return (isNaN(s) ? 60 : s) * 1000; };
-function schedule(ms) {
-  clearTimeout(pollTimer);
-  const base = pollMs();
-  if (!base) return; /* حالت دستی */
-  pollTimer = setTimeout(() => tick(false), Math.max(ms || base, 1000));
-}
+const RESUME_GAP = 120000;
 
-async function fetchFull(id) {
-  const row = await api('job?job_id=' + encodeURIComponent(id));
-  if (!row || !row.job_id) return;
-  const p = parseRow(row);
-  LS.set('hl_res_' + id, p);
-  const title = (p.scenario && p.scenario.title) || undefined;
-  if (title) upsertJob({ id: id, reelTitle: title });
-}
-
-async function refreshJob(id, forceFull) {
+async function refreshJob(id) {
   const j = getJob(id);
   if (!j) return;
   try {
-    const light = await api('job?job_id=' + encodeURIComponent(id) + '&light=1');
-    if (!light || !light.job_id) {
+    const row = await api('job?job_id=' + encodeURIComponent(id));
+    if (!row || !row.found) {
       const misses = (j.misses || 0) + 1;
-      const old = Date.now() - (j.created || 0) > 4 * 60000;
-      if (misses > 6 && old) upsertJob({ id: id, status: 'failed', message: 'این سفارش در سرور پیدا نشد.', misses: misses, updated: Date.now() });
+      const old = Date.now() - (j.created || 0) > 10 * 60000;
+      if (misses > 3 && old) upsertJob({ id: id, status: 'failed', message: 'این سفارش در سرور پیدا نشد.', misses: misses, updated: Date.now() });
       else upsertJob({ id: id, misses: misses, updated: Date.now() });
       return;
     }
-    const patch = { id: id, status: light.status || 'running', stage: light.stage || j.stage, progress: Number(light.progress) || 0, message: light.message || '', error: light.error || '', misses: 0, netErr: 0, lastError: '', updated: Date.now() };
+    const p = parseRow(row);
+    LS.set('hl_res_' + id, p);
+    const patch = { id: id, status: row.status || 'running', stage: row.stage || j.stage, progress: Number(row.progress) || 0, message: row.message || '', error: row.error || '', misses: 0, netErr: 0, lastError: '', updated: Date.now() };
+    const title = p.scenario && p.scenario.title;
+    if (title) patch.reelTitle = title;
     upsertJob(patch);
-    if (forceFull || patch.stage !== j.stage || patch.status !== 'running') await fetchFull(id);
   } catch (e) {
     upsertJob({ id: id, netErr: (j.netErr || 0) + 1, lastError: friendly(e), updated: Date.now() });
   }
 }
 
-/* once=true: همه پروژه‌های در حال اجرا یک‌بار؛ once=false: فقط پروژه‌ای که الان باز است */
-async function tick(once) {
-  if (polling) return;
-  polling = true;
-  const r = route();
+async function refreshRunning() {
+  const list = jobsList().filter((j) => j.status === 'running' && Date.now() - (j.updated || 0) > RESUME_GAP);
+  for (const j of list) await refreshJob(j.id);
+  softRender(); updateBadge();
+}
+
+/* ---------- اعلان پوش (Firebase Cloud Messaging) ---------- */
+const PN = () => window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.PushNotifications;
+const getToken = () => LS.get('hl_fcm', '') || '';
+async function onPush(data, openIt) {
+  const id = data && data.job_id;
+  if (!id) return;
+  if (!getJob(id)) return;
+  await refreshJob(id);
+  softRender(); updateBadge();
+  if (openIt) location.hash = '#/job/' + encodeURIComponent(id);
+}
+async function initPush() {
+  const P = PN();
+  if (!P) return;
   try {
-    let targets = jobsList().filter((j) => j.status === 'running');
-    if (!once) targets = r.name === 'job' ? targets.filter((j) => j.id === r.id) : [];
-    for (const j of targets) await refreshJob(j.id);
-    softRender();
-  } finally {
-    polling = false;
-    updateBadge();
-    const r2 = route(); const cur = r2.name === 'job' ? getJob(r2.id) : null;
-    if (cur && cur.status === 'running' && !document.hidden) schedule();
-  }
+    P.addListener('registration', (t) => { if (t && t.value) LS.set('hl_fcm', t.value); });
+    P.addListener('registrationError', () => { /* Firebase تنظیم نشده یا اجازه داده نشده */ });
+    P.addListener('pushNotificationReceived', (n) => { onPush(n && n.data, false); toast((n && n.title) || 'نتیجه آماده شد'); });
+    P.addListener('pushNotificationActionPerformed', (a) => { onPush(a && a.notification && a.notification.data, true); });
+    try { await P.createChannel({ id: 'hookloom_jobs', name: 'نتیجه سفارش‌ها', importance: 4 }); } catch (e) { /* ignore */ }
+    let perm = await P.checkPermissions();
+    if (perm.receive === 'prompt' || perm.receive === 'prompt-with-rationale') perm = await P.requestPermissions();
+    if (perm.receive === 'granted') await P.register();
+  } catch (e) { /* پوش در دسترس نیست */ }
 }
-/* هنگام ورود به صفحه یک پروژه در حال اجرا: اگر داده کهنه است یک‌بار بروزرسانی کن */
-function maybePoll(id) {
-  const j = getJob(id);
-  if (!j || j.status !== 'running' || !pollMs()) return;
-  const age = Date.now() - (j.updated || 0);
-  if (age > MIN_GAP) schedule(800); else schedule(Math.max(pollMs() - age, 1000));
-}
-document.addEventListener('visibilitychange', () => {
-  clearTimeout(pollTimer);
-  if (document.hidden || !pollMs()) return;
-  const stale = jobsList().filter((j) => j.status === 'running' && Date.now() - (j.updated || 0) > MIN_GAP);
-  if (stale.length) tick(true); else { const r = route(); if (r.name === 'job') maybePoll(r.id); }
-});
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshRunning(); });
+const AppPlugin = () => window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.App;
+try { const A = AppPlugin(); if (A && A.addListener) A.addListener('appStateChange', (st) => { if (st && st.isActive) refreshRunning(); }); } catch (e) { /* ignore */ }
 
 function updateBadge() {
   const n = jobsList().filter((j) => j.status === 'running').length;
@@ -216,10 +209,7 @@ function render() {
   updateBadge();
 }
 function onRoute() {
-  clearTimeout(pollTimer);
   render();
-  const r = route();
-  if (r.name === 'job') maybePoll(r.id);
 }
 function sigFor(r) {
   if (r.name === 'jobs') return JSON.stringify(jobsList().map((j) => [j.id, j.status, j.stage, j.progress, j.reelTitle]));
@@ -252,7 +242,7 @@ const dl = (id, arr) => `<datalist id="${id}">${arr.map((x) => `<option value="$
 function viewNew() {
   const d = LS.get('hl_draft', {}) || {};
   const v = (k, def) => esc(d[k] != null ? d[k] : (def || ''));
-  const n = Number(d.reels_to_analyze) || 8;
+  const n = Math.min(10, Number(d.reels_to_analyze) || 8);
   const noKey = !getSettings().key ? '<div class="note">⚠ هنوز کلید دسترسی تنظیم نشده است. ابتدا به بخش «تنظیمات» بروید.</div>' : '';
   return `
   <h2 class="pg">سفارش جدید</h2>
@@ -279,7 +269,7 @@ function viewNew() {
           <div class="field"><label>حداقل بازدید</label><select name="min_views">${opts(VIEWS, d.min_views || 1000000)}</select></div>
           <div class="field"><label>بازه زمانی</label><select name="days_window">${opts(DAYS, d.days_window || 90)}</select></div>
         </div>
-        <div class="field"><label>تعداد ریل برای تحلیل: <b id="rv">${fa(n)}</b></label><input type="range" name="reels_to_analyze" min="3" max="12" step="1" value="${n}"><small>ریل بیشتر یعنی دقت بالاتر ولی زمان و هزینه بیشتر.</small></div>
+        <div class="field"><label>تعداد ریل برای تحلیل: <b id="rv">${fa(n)}</b></label><input type="range" name="reels_to_analyze" min="3" max="10" step="1" value="${n}"><small>ریل بیشتر یعنی دقت بالاتر ولی زمان و هزینه بیشتر.</small></div>
       </div>
     </details>
     <div class="note">⏱ پردازش کامل معمولاً ۱۵ تا ۴۰ دقیقه طول می‌کشد. می‌توانید اپ را ببندید؛ وضعیت از بخش «پروژه‌ها» قابل پیگیری است.</div>
@@ -301,13 +291,15 @@ async function submitOrder(form) {
   const body = Object.assign({}, fd, {
     instagram_handle: (fd.instagram_handle || '').replace(/^@+/, ''),
     min_views: Number(fd.min_views) || 1000000, days_window: Number(fd.days_window) || 90,
-    reels_to_analyze: Math.min(12, Math.max(3, Number(fd.reels_to_analyze) || 8)),
-    content_language: fd.content_language || 'فارسی'
+    reels_to_analyze: Math.min(10, Math.max(3, Number(fd.reels_to_analyze) || 8)),
+    content_language: fd.content_language || 'فارسی',
+    fcm_token: getToken()
   });
   const btn = $('#submitBtn'); btn.disabled = true; btn.textContent = 'در حال ارسال به ورک‌فلو…';
   try {
     const res = await api('order', { method: 'POST', body: JSON.stringify(body) });
     if (!res || !res.job_id) throw new ApiError('پاسخ نامعتبر از سرور', 0, JSON.stringify(res));
+    delete body.fcm_token;
     upsertJob({ id: res.job_id, brief: body, title: body.business_name, status: 'running', stage: 'queued', progress: 5, message: 'سفارش ثبت شد', created: Date.now(), updated: Date.now() });
     LS.del('hl_draft');
     toast('سفارش ثبت شد ✓');
@@ -348,8 +340,7 @@ function viewJob(id) {
   const head = `<div class="jh"><button class="back" data-act="nav" data-to="#/jobs">›</button><h2>${esc(j.reelTitle || j.title || 'پروژه')}</h2><span class="badge ${st}">${STATUS_FA[st] || st}</span></div>`;
   let prog = '';
   if (st === 'running') {
-    const sec = Number(getSettings().pollSec);
-    const modeTxt = sec ? 'بروزرسانی خودکار هر ' + fa(sec >= 60 ? sec / 60 : sec) + (sec >= 60 ? ' دقیقه' : ' ثانیه') + ' (فقط وقتی این صفحه باز است)' : 'بروزرسانی دستی — برای دیدن پیشرفت دکمه بروزرسانی را بزنید';
+    const modeTxt = getToken() ? 'می‌توانید اپ را ببندید؛ با آماده‌شدن نتیجه یک اعلان دریافت می‌کنید.' : 'اعلان فعال نیست؛ برای دیدن پیشرفت دکمه بروزرسانی را بزنید.';
     prog = `<div class="card"><div class="bar"><i style="width:${j.progress || 0}%"></i></div>
       <p class="msg"><b>${fa(j.progress || 0)}٪</b> · ${esc(j.message || 'در حال پردازش…')}</p>
       <ul class="steps">${STAGES.map((s, i) => `<li class="${i < idx ? 'ok' : (i === idx ? 'on' : '')}"><s>${i < idx ? '✓' : fa(i + 1)}</s>${s[1]}</li>`).join('')}</ul>
@@ -515,18 +506,17 @@ function viewSettings() {
   <div class="card">
     <div class="field"><label>آدرس سرور n8n</label><input class="ltr" id="s-url" value="${esc(s.baseUrl)}" inputmode="url" autocapitalize="none"><small>مثال: https://yourname.app.n8n.cloud</small></div>
     <div class="field"><label>کلید دسترسی (X-Call-Key)</label><div class="pwwrap"><input class="ltr" id="s-key" type="password" value="${esc(s.key)}" autocapitalize="none" autocomplete="off"><button class="mini" data-act="toggle-key">نمایش</button></div><small>همان مقدار Credential نوع Header Auth در n8n (نام هدر: X-Call-Key).</small></div>
-    <div class="field"><label>بروزرسانی خودکار وضعیت</label><select id="s-poll">${opts(POLL_OPTIONS, s.pollSec)}</select><small>هر بروزرسانی یک اجرا (execution) در n8n مصرف می‌کند. بروزرسانی خودکار فقط وقتی صفحه پروژه باز است انجام می‌شود. با حالت «دستی» مصرف تقریباً صفر است.</small></div>
     <div class="actions"><button class="btn" data-act="save-settings">💾 ذخیره</button><button class="btn ghost" data-act="test" id="testBtn">🔌 تست اتصال</button></div>
     <p id="testRes" class="sub" style="margin:10px 0 0"></p>
   </div>
-  <div class="note">اپ دو آدرس را صدا می‌زند:<br><span dir="ltr">POST /webhook/hookloom/order</span><br><span dir="ltr">GET /webhook/hookloom/job?job_id=…</span><br>ورک‌فلو باید در n8n «Publish» شده باشد.</div>
+  <div class="note">اپ دو آدرس را صدا می‌زند:<br><span dir="ltr">POST /webhook/hookloom/order</span><br><span dir="ltr">GET /webhook/hookloom/job?job_id=…</span> (فقط هنگام اعلان یا بروزرسانی دستی)<br>ورک‌فلو باید در n8n «Publish» شده باشد.</div>
   <div class="card"><b>داده‌های دستگاه</b><p class="sub" style="margin:4px 0 10px">تاریخچه پروژه‌ها فقط روی همین گوشی ذخیره شده است.</p><button class="btn danger" data-act="clear-all">🗑 پاک‌کردن همه پروژه‌ها</button></div>
-  <p class="sub" style="text-align:center">Hookloom v1.1 · ساخته‌شده با Capacitor</p>`;
+  <p class="sub" style="text-align:center">Hookloom v1.2 · ساخته‌شده با Capacitor</p>`;
 }
 function readSettings() {
   let url = ($('#s-url').value || '').trim().replace(/\/+$/, '');
   if (url && !/^https?:\/\//i.test(url)) url = 'https://' + url;
-  return { baseUrl: url || DEFAULT_URL, key: ($('#s-key').value || '').trim(), pollSec: Number($('#s-poll').value) };
+  return { baseUrl: url || DEFAULT_URL, key: ($('#s-key').value || '').trim() };
 }
 async function testConnection() {
   const out = $('#testRes'); const btn = $('#testBtn');
@@ -550,8 +540,8 @@ document.addEventListener('click', (e) => {
   else if (act === 'tab') { ui.tab[id] = el.dataset.tab; render(); }
   else if (act === 'copy-md') { copyText(getRes(id).scenarioMd || ''); }
   else if (act === 'share-md') { const r = getRes(id); shareText((r.scenario && r.scenario.title) || 'سناریوی هوک‌لوم', r.scenarioMd || ''); }
-  else if (act === 'refresh') { toast('در حال بروزرسانی…'); refreshJob(id, true).then(() => { softRender(); schedule(); }); }
-  else if (act === 'refresh-all') { toast('در حال بروزرسانی…'); tick(true); }
+  else if (act === 'refresh') { toast('در حال بروزرسانی…'); refreshJob(id).then(() => { softRender(); updateBadge(); }); }
+  else if (act === 'refresh-all') { toast('در حال بروزرسانی…'); jobsList().filter((j) => j.status === 'running').reduce((p, j) => p.then(() => refreshJob(j.id)), Promise.resolve()).then(() => { softRender(); updateBadge(); }); }
   else if (act === 'reuse') { const j = getJob(id); if (j && j.brief) LS.set('hl_draft', j.brief); location.hash = '#/new'; }
   else if (act === 'delete-job') {
     if (confirm('این پروژه از فهرست گوشی حذف شود؟')) { saveJobs(jobsList().filter((x) => x.id !== id)); LS.del('hl_res_' + id); location.hash = '#/jobs'; }
@@ -581,6 +571,6 @@ setInterval(() => {
 /* ---------- شروع ---------- */
 onRoute();
 updateBadge();
-/* در شروع اپ، یک‌بار وضعیت پروژه‌های در حال اجرا را بروزرسانی کن (اگر حالت دستی نیست) */
-if (pollMs() && jobsList().some((j) => j.status === 'running' && Date.now() - (j.updated || 0) > MIN_GAP)) tick(true);
+initPush();
+refreshRunning();
 })();

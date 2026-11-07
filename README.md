@@ -7,14 +7,26 @@
 ## معماری
 
 ```
-اپ (Capacitor + HTML/JS)  ──POST /webhook/hookloom/order──▶  n8n
-          ▲                                                    │ Apify → Gemini → شورای Claude/GPT/Gemini
-          └──GET /webhook/hookloom/job?job_id=…&light=1────────┘ ذخیره نتیجه در Google Sheets
+اپ (Capacitor + HTML/JS) ──POST /webhook/hookloom/order──▶ n8n ──▶ Apify → Gemini → شورای Claude/GPT/Gemini
+        ▲                                                        │ ذخیره در Google Sheets
+        │◀──────── اعلان پوش (FCM) در پایان کار یا خطا ◀──────────┘
+        └──GET /webhook/hookloom/job?job_id=…  (فقط یک‌بار، بعد از اعلان یا با دکمه بروزرسانی)
 ```
 
+- بدون پولینگ: اپ هیچ تایمر خودکاری ندارد. ورک‌فلو در پایان (یا هنگام خطا) اعلان پوش می‌فرستد و اپ نتیجه را یک‌بار می‌خواند.
+- توکن FCM دستگاه همراه سفارش (`fcm_token`) ارسال و در تب `jobs` ذخیره می‌شود.
+- تکه‌های JSON بزرگ (`*_2`, `*_3` ...) را وب‌هوک job سمت سرور به هم می‌چسباند.
 - هر دو وب‌هوک با هدر **`X-Call-Key`** (Header Auth) محافظت می‌شوند.
-- اپ هر ~۷ ثانیه وضعیت سبک (`light=1`) را می‌خواند و با تغییر مرحله یا پایان کار، نتیجه کامل را دریافت می‌کند.
-- تاریخچه پروژه‌ها روی گوشی ذخیره می‌شود.
+- هر خطا در ورک‌فلو با Error Trigger گرفته می‌شود و سفارش (با `execution_id`) به‌صورت failed علامت می‌خورد.
+
+## فعال‌سازی اعلان پوش (یک‌بار)
+
+1. در Firebase Console یک پروژه بسازید و اپ اندروید با Package name برابر `app.hookloom.studio` اضافه کنید؛ فایل `google-services.json` را بگیرید.
+2. در GitHub: Settings → Secrets → `GOOGLE_SERVICES_JSON` = محتوای فایل به‌صورت base64 (`base64 -w0 google-services.json`).
+3. در Firebase: Project settings → Service accounts → Generate new private key.
+4. در n8n یک Credential از نوع **Google Service Account API** بسازید (کلید مرحله ۳، گزینه «Set up for use in HTTP Request node»، Scope: `https://www.googleapis.com/auth/firebase.messaging`).
+5. در ورک‌فلو دو نود `FCM Push (Done)` و `FCM Push (Failed)` را باز کنید: Credential را انتخاب، `YOUR_FIREBASE_PROJECT_ID` را در URL عوض و نود را Enable کنید.
+6. APK جدید را از Releases نصب کنید.
 
 ## صفحات اپ
 
